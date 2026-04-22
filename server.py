@@ -1,0 +1,606 @@
+import os
+import json
+import asyncio
+import subprocess
+import base64
+import socket
+import ssl
+from datetime import datetime
+from urllib.parse import unquote, urlsplit
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+import glob
+import httpx
+
+app = FastAPI()
+
+# Config storage
+DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+DEFAULT_CONFIG = {
+    "api_key": "",
+    "api_base": "https://rossa.cfd/api",
+    "email_domain": "rossa.cfd",
+    "email_domains": "rossa.cfd",
+    "yescaptcha_key": "",
+    "proxy_enabled": False,
+    "proxy_scheme": "http",
+    "proxy_url": "",
+}
+
+def normalize_proxy(proxy_url: str, proxy_scheme: str = "http") -> dict:
+    raw = (proxy_url or "").strip()
+    scheme = (proxy_scheme or "http").strip().lower()
+    if scheme not in ("http", "https", "socks5"):
+        scheme = "http"
+    if not raw:
+        raise ValueError("请填写代理地址")
+
+    target = raw if "://" in raw else f"{scheme}://{raw}"
+    parsed = urlsplit(target)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https", "socks5"):
+        raise ValueError("仅支持 http、https、socks5 代理")
+
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    username = unquote(parsed.username or "")
+    password = unquote(parsed.password or "")
+
+    if (not host or not port) and "://" not in raw:
+        if "@" in raw:
+            left, right = raw.split("@", 1)
+            left_parts = left.split(":")
+            right_parts = right.split(":")
+            if len(left_parts) >= 2 and left_parts[1].isdigit():
+                host, port = left_parts[0], int(left_parts[1])
+                username = right_parts[0] if len(right_parts) > 0 else ""
+                password = ":".join(right_parts[1:]) if len(right_parts) > 1 else ""
+            elif len(right_parts) >= 2 and right_parts[-1].isdigit():
+                username = left_parts[0] if len(left_parts) > 0 else ""
+                password = ":".join(left_parts[1:]) if len(left_parts) > 1 else ""
+                host, port = ":".join(right_parts[:-1]), int(right_parts[-1])
+        else:
+            parts = raw.split(":")
+            if len(parts) >= 4 and parts[1].isdigit():
+                host, port = parts[0], int(parts[1])
+                username = parts[2]
+                password = ":".join(parts[3:])
+            elif len(parts) == 2 and parts[1].isdigit():
+                host, port = parts[0], int(parts[1])
+
+    if not host or not port:
+        raise ValueError("代理格式错误，请参考示例填写")
+
+    auth = f"{username}:{password}@" if username or password else ""
+    server = f"{scheme}://{host}:{port}"
+    url = f"{scheme}://{auth}{host}:{port}"
+    return {
+        "scheme": scheme,
+        "host": host,
+        "port": int(port),
+        "username": username,
+        "password": password,
+        "server": server,
+        "url": url,
+    }
+
+def _proxy_auth_header(username: str, password: str) -> str:
+    if not username and not password:
+        return ""
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Proxy-Authorization: Basic {token}\r\n"
+
+def _test_http_proxy(proxy: dict) -> tuple[bool, str]:
+    sock = socket.create_connection((proxy["host"], proxy["port"]), timeout=8)
+    if proxy["scheme"] == "https":
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=proxy["host"])
+    with sock:
+        sock.settimeout(8)
+        req = (
+            "CONNECT www.adobe.com:443 HTTP/1.1\r\n"
+            "Host: www.adobe.com:443\r\n"
+            f"{_proxy_auth_header(proxy['username'], proxy['password'])}"
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(req.encode())
+        data = sock.recv(1024).decode("iso-8859-1", errors="ignore")
+        status = data.splitlines()[0] if data else ""
+        if not status.startswith("HTTP/"):
+            return False, "代理未返回有效 HTTP 响应"
+        code = int(status.split()[1])
+        if code == 200:
+            tunnel = ssl.create_default_context().wrap_socket(sock, server_hostname="www.adobe.com")
+            tunnel.sendall(b"HEAD / HTTP/1.1\r\nHost: www.adobe.com\r\nConnection: close\r\n\r\n")
+            target_data = tunnel.recv(1024).decode("iso-8859-1", errors="ignore")
+            target_status = target_data.splitlines()[0] if target_data else ""
+            if target_status.startswith("HTTP/"):
+                return True, f"代理可用，已连通 Adobe HTTPS ({target_status})"
+            return True, "代理可用，HTTPS 隧道已建立"
+
+    if status.startswith("HTTP/"):
+        code = int(status.split()[1])
+        if code == 407:
+            return False, "代理需要认证，用户名或密码可能不正确"
+        if code == 403:
+            return False, "代理拒绝建立 HTTPS 隧道 (403)，请检查 IP 白名单、套餐权限、协议或端口"
+        return False, f"代理连通但建立 HTTPS 隧道失败，状态码 {code}"
+    return False, "代理未返回有效 HTTP 响应"
+
+def _test_socks5_proxy(proxy: dict) -> tuple[bool, str]:
+    with socket.create_connection((proxy["host"], proxy["port"]), timeout=8) as sock:
+        sock.settimeout(8)
+        methods = [0x00]
+        if proxy["username"] or proxy["password"]:
+            methods.append(0x02)
+        sock.sendall(bytes([0x05, len(methods), *methods]))
+        resp = sock.recv(2)
+        if len(resp) < 2 or resp[0] != 0x05:
+            if resp.startswith(b"H"):
+                return False, "当前端口返回 HTTP 响应，不是 SOCKS5；请改选 http/https 或更换 SOCKS5 端口"
+            return False, f"SOCKS5 握手失败，代理返回: {resp.hex() or '空响应'}"
+        if resp[1] == 0xFF:
+            return False, "SOCKS5 代理不接受当前认证方式"
+        if resp[1] == 0x02:
+            username = proxy["username"].encode()
+            password = proxy["password"].encode()
+            if len(username) > 255 or len(password) > 255:
+                return False, "SOCKS5 用户名或密码过长"
+            sock.sendall(bytes([0x01, len(username)]) + username + bytes([len(password)]) + password)
+            auth = sock.recv(2)
+            if len(auth) < 2 or auth[1] != 0x00:
+                return False, "SOCKS5 用户名或密码错误"
+
+        host = b"example.com"
+        sock.sendall(bytes([0x05, 0x01, 0x00, 0x03, len(host)]) + host + (80).to_bytes(2, "big"))
+        resp = sock.recv(10)
+        if len(resp) < 2 or resp[1] != 0x00:
+            return False, f"SOCKS5 连接目标站点失败，错误码 {resp[1] if len(resp) > 1 else '未知'}"
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        data = sock.recv(1024).decode("iso-8859-1", errors="ignore")
+    return (True, "SOCKS5 代理可用") if data.startswith("HTTP/") else (False, "SOCKS5 已连接但目标站点响应异常")
+
+def test_proxy_connectivity(proxy_url: str, proxy_scheme: str) -> tuple[bool, str, dict | None]:
+    try:
+        proxy = normalize_proxy(proxy_url, proxy_scheme)
+        if proxy["scheme"] == "socks5":
+            ok, message = _test_socks5_proxy(proxy)
+        else:
+            ok, message = _test_http_proxy(proxy)
+        return ok, message, proxy
+    except Exception as e:
+        return False, f"代理检测失败: {e}", None
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        data = json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
+        # 兼容旧配置：如果只有 email_domain 没有 email_domains，自动迁移
+        if "email_domains" not in data and "email_domain" in data:
+            data["email_domains"] = data["email_domain"]
+        for key, value in DEFAULT_CONFIG.items():
+            data.setdefault(key, value)
+        return data
+    return DEFAULT_CONFIG.copy()
+
+def save_config(data: dict):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def resolve_data_file(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    data_path = os.path.join(DATA_DIR, path)
+    if os.path.exists(data_path):
+        return data_path
+    return path
+
+config = load_config()
+
+# ─── Task Management ───
+class Task:
+    def __init__(self, task_id, quantity, concurrency=1, show_browser=False):
+        self.id = task_id
+        self.quantity = quantity
+        self.concurrency = concurrency
+        self.show_browser = show_browser
+        self.status = "pending"     # pending -> running -> stopping -> completed/stopped
+        self.completed = 0
+        self.failed = 0
+        self.created_at = datetime.now().strftime("%H:%M:%S")
+        self.result_files = []
+        self.asyncio_tasks = []
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "quantity": self.quantity,
+            "concurrency": self.concurrency,
+            "show_browser": self.show_browser,
+            "status": self.status,
+            "completed": self.completed,
+            "failed": self.failed,
+            "created_at": self.created_at,
+            "result_count": len(self.result_files),
+            "result_files": self.result_files,
+        }
+
+class TaskManager:
+    def __init__(self):
+        self.tasks: dict[int, Task] = {}
+        self.next_id = 1
+        self.websockets = []
+        self.queue = asyncio.Queue()
+        self._worker_running = False
+        self.load_tasks()
+
+    def save_tasks(self):
+        data = {
+            "next_id": self.next_id,
+            "tasks": [t.to_dict() for t in self.tasks.values()]
+        }
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_tasks(self):
+        if os.path.exists(TASKS_FILE):
+            try:
+                with open(TASKS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.next_id = data.get("next_id", 1)
+                    for t_data in data.get("tasks", []):
+                        t = Task(t_data["id"], t_data["quantity"], t_data.get("concurrency", 1), t_data.get("show_browser", False))
+                        t.status = t_data["status"]
+                        t.completed = t_data.get("completed", 0)
+                        t.failed = t_data.get("failed", 0)
+                        t.created_at = t_data.get("created_at", "")
+                        t.result_files = t_data.get("result_files", [])
+                        # Mark interrupted tasks as stopped
+                        if t.status in ("running", "pending", "stopping"):
+                            t.status = "stopped"
+                        self.tasks[t.id] = t
+            except Exception as e:
+                print(f"Failed to load tasks: {e}")
+
+    def create_task(self, quantity, concurrency=1, show_browser=False) -> Task:
+        task = Task(self.next_id, quantity, concurrency, show_browser)
+        self.tasks[self.next_id] = task
+        self.next_id += 1
+        return task
+
+    def delete_tasks(self, ids: list[int]):
+        for tid in ids:
+            if tid in self.tasks:
+                t = self.tasks[tid]
+                # Only delete non-running tasks
+                if t.status not in ("running", "pending"):
+                    del self.tasks[tid]
+
+    def stop_tasks(self, ids: list[int]):
+        for tid in ids:
+            if tid in self.tasks:
+                t = self.tasks[tid]
+                if t.status in ("pending", "running"):
+                    # 设为 stopping：正在跑的 worker 继续跑完，等待中的 worker 不再启动
+                    t.status = "stopping"
+
+    async def broadcast(self, message: str):
+        if message == "__STATE_UPDATE__":
+            self.save_tasks()
+
+        disconnected = []
+        for ws in self.websockets:
+            try:
+                await ws.send_text(message)
+            except WebSocketDisconnect:
+                disconnected.append(ws)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            self.websockets.remove(ws)
+
+    async def start_queue_worker(self):
+        """Single worker that processes tasks from the queue one by one."""
+        if self._worker_running:
+            return
+        self._worker_running = True
+        while True:
+            task = await self.queue.get()
+            if task.status == "stopped":
+                self.queue.task_done()
+                continue
+            try:
+                await run_task(task)
+            except Exception as e:
+                await self.broadcast(f"❌ 任务 #{task.id} 异常: {e}")
+                task.status = "completed"
+            self.queue.task_done()
+
+task_manager = TaskManager()
+
+# ─── Models ───
+class ConfigUpdate(BaseModel):
+    api_key: str
+    api_base: str
+    email_domain: str = "rossa.cfd"
+    email_domains: str = ""  # 逗号分隔的多域名列表
+    yescaptcha_key: str = ""
+    proxy_enabled: bool = False
+    proxy_scheme: str = "http"
+    proxy_url: str = ""
+
+class ProxyTestRequest(BaseModel):
+    proxy_scheme: str = "http"
+    proxy_url: str = ""
+
+class TaskStart(BaseModel):
+    quantity: int
+    concurrency: int = 1
+    show_browser: bool = False
+
+class TaskDeleteRequest(BaseModel):
+    ids: list[int]
+
+# ─── Config Endpoints ───
+@app.post("/api/config")
+async def update_config(item: ConfigUpdate):
+    global config
+    proxy_scheme = item.proxy_scheme if item.proxy_scheme in ("http", "https", "socks5") else "http"
+    config = {
+        "api_key": item.api_key,
+        "api_base": item.api_base,
+        "email_domain": item.email_domain,
+        "email_domains": item.email_domains,
+        "yescaptcha_key": item.yescaptcha_key,
+        "proxy_enabled": item.proxy_enabled,
+        "proxy_scheme": proxy_scheme,
+        "proxy_url": item.proxy_url.strip(),
+    }
+    save_config(config)
+    return {"status": "ok"}
+
+@app.post("/api/test-proxy")
+async def test_proxy(item: ProxyTestRequest):
+    ok, message, proxy = test_proxy_connectivity(item.proxy_url, item.proxy_scheme)
+    return {
+        "valid": ok,
+        "message": message,
+        "normalized": proxy["url"] if proxy else "",
+    }
+
+@app.post("/api/test-config")
+async def test_config(item: ConfigUpdate):
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{item.api_base}/emails",
+                headers={"X-API-Key": item.api_key},
+                timeout=5.0
+            )
+            if response.status_code == 401:
+                return {"valid": False, "message": "API Key 无效 (401 Auth Error)"}
+            elif response.status_code in (301, 302, 307, 308):
+                return {"valid": False, "message": f"连接被重定向 ({response.status_code})，请检查 URL 是否缺少 '/api' 结尾"}
+            elif response.status_code == 200:
+                return {"valid": True, "message": "API 配置有效可用！"}
+            else:
+                 return {"valid": False, "message": f"连接异常，状态码: {response.status_code}"}
+    except Exception as e:
+        return {"valid": False, "message": f"连接异常: {str(e)}"}
+
+@app.post("/api/test-captcha-config")
+async def test_captcha_config(data: dict):
+    key = data.get("yescaptcha_key", "")
+    if not key:
+        return {"valid": False, "message": "请填写 API Key"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.yescaptcha.com/getBalance",
+                json={"clientKey": key},
+                timeout=10.0
+            )
+            result = resp.json()
+            if result.get("errorId") == 0:
+                balance = result.get("balance", 0)
+                return {"valid": True, "message": f"有效！余额: {balance} 点"}
+            else:
+                return {"valid": False, "message": f"无效: {result.get('errorDescription', '未知错误')}"}
+    except Exception as e:
+        return {"valid": False, "message": f"连接异常: {str(e)}"}
+
+@app.get("/api/config")
+async def get_config():
+    return config
+
+# ─── Task Endpoints ───
+@app.post("/api/tasks")
+async def start_task(item: TaskStart):
+    conc = max(1, min(item.concurrency, 10))
+    task = task_manager.create_task(item.quantity, conc, item.show_browser)
+    await task_manager.queue.put(task)
+
+    # Ensure queue worker is running
+    asyncio.create_task(task_manager.start_queue_worker())
+
+    return task.to_dict()
+
+@app.get("/api/tasks")
+async def list_tasks():
+    return [t.to_dict() for t in reversed(task_manager.tasks.values())]
+
+@app.post("/api/tasks/delete")
+async def delete_tasks(req: TaskDeleteRequest):
+    task_manager.delete_tasks(req.ids)
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", "deleted": len(req.ids)}
+
+@app.post("/api/tasks/stop")
+async def stop_tasks(req: TaskDeleteRequest):
+    task_manager.stop_tasks(req.ids)
+    await task_manager.broadcast("__STATE_UPDATE__")
+    return {"status": "ok", "stopped": len(req.ids)}
+
+# ─── Worker Logic ───
+async def execute_single_worker(task: Task, worker_index: int):
+    env = os.environ.copy()
+    env["API_KEY"] = config["api_key"]
+    env["API_BASE"] = config["api_base"]
+    env["EMAIL_DOMAIN"] = config.get("email_domain", "rossa.cfd")
+    # 多域名列表：传给 worker 进程，实现均匀分布
+    env["EMAIL_DOMAINS"] = config.get("email_domains", "") or config.get("email_domain", "rossa.cfd")
+    env["YESCAPTCHA_KEY"] = config.get("yescaptcha_key", "")
+    env["PROXY_ENABLED"] = "1" if config.get("proxy_enabled") else "0"
+    env["PROXY_SCHEME"] = config.get("proxy_scheme", "http")
+    env["PROXY_URL"] = config.get("proxy_url", "")
+    env["DATA_DIR"] = DATA_DIR
+    env["SCREENSHOT_DIR"] = SCREENSHOT_DIR
+    env["CONFIG_FILE"] = CONFIG_FILE
+    env["SHOW_BROWSER"] = "1" if task.show_browser else "0"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # 给每个 worker 分配唯一的 Cookie 文件名，避免并发时互相"偷"文件
+    cookie_id = f"task{task.id}_w{worker_index}"
+    env["COOKIE_ID"] = cookie_id
+    expected_cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
+
+    prefix = f"[任务#{task.id}-{worker_index}]"
+
+    process = await asyncio.create_subprocess_exec(
+        "python", "-u", "auto_register_firefly.py",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env
+    )
+
+    try:
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode('utf-8', errors='ignore').strip()
+            await task_manager.broadcast(f"{prefix} {decoded}")
+
+        await process.wait()
+
+        # 只检查该 worker 专属的 cookie 文件是否存在
+        if os.path.exists(expected_cookie_file):
+            task.completed += 1
+            task.result_files.append(expected_cookie_file)
+            await task_manager.broadcast(f"{prefix} ✅ 注册成功！(Cookie 已导出)")
+        else:
+            task.failed += 1
+            await task_manager.broadcast(f"{prefix} ❌ 失败 (未获取到 Cookie)")
+    except asyncio.CancelledError:
+        try:
+            process.terminate()
+        except:
+            pass
+        task.failed += 1
+        await task_manager.broadcast(f"{prefix} 🛑 操作已停止")
+        raise
+    finally:
+        await task_manager.broadcast("__STATE_UPDATE__")
+
+async def run_task(task: Task):
+    task.status = "running"
+    await task_manager.broadcast("__STATE_UPDATE__")
+
+    sem = asyncio.Semaphore(task.concurrency)
+
+    async def wrapper(idx):
+        async with sem:
+            # 优雅停止：获取信号量后检查任务是否已标记停止
+            if task.status == "stopping":
+                await task_manager.broadcast(f"[任务#{task.id}-{idx}] ⏭️ 任务已停止，跳过")
+                return
+            await execute_single_worker(task, idx)
+
+    workers = [asyncio.create_task(wrapper(i)) for i in range(1, task.quantity + 1)]
+    task.asyncio_tasks = workers
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    if task.status == "stopping":
+        task.status = "stopped"
+        await task_manager.broadcast(f"🏁 任务 #{task.id} 已优雅停止 (成功 {task.completed}, 失败 {task.failed})")
+    elif task.status != "stopped":
+        task.status = "completed"
+        await task_manager.broadcast(f"🏁 任务 #{task.id} 结束 (成功 {task.completed}, 失败 {task.failed})")
+    await task_manager.broadcast("__STATE_UPDATE__")
+
+# ─── WebSocket ───
+@app.websocket("/ws/logs")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    task_manager.websockets.append(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if websocket in task_manager.websockets:
+            task_manager.websockets.remove(websocket)
+
+# ─── Export ───
+@app.get("/api/export")
+async def export_results(ids: str = ""):
+    # Filter by task IDs if provided
+    if ids:
+        target_ids = set(int(x) for x in ids.split(",") if x.strip().isdigit())
+        result_files = []
+        for t in task_manager.tasks.values():
+            if t.id in target_ids:
+                if t.result_files:
+                    result_files.extend(resolve_data_file(f) for f in t.result_files)
+                else:
+                    # Fallback for older tasks before result_files was saved to JSON
+                    import glob
+                    result_files.extend(glob.glob(os.path.join(SCREENSHOT_DIR, f"cookie_task{t.id}_*.json")))
+    else:
+        result_files = []
+        for t in task_manager.tasks.values():
+            if t.result_files:
+                result_files.extend(resolve_data_file(f) for f in t.result_files)
+            else:
+                import glob
+                result_files.extend(glob.glob(os.path.join(SCREENSHOT_DIR, f"cookie_task{t.id}_*.json")))
+
+    combined = []
+    for f in result_files:
+        try:
+            data = json.load(open(f, "r", encoding="utf-8"))
+            if "cookie" in data and "name" in data:
+                combined.append(data)
+        except:
+            pass
+
+    if not combined:
+        return JSONResponse(status_code=404, content={"error": "暂无成功记录可导出"})
+
+    # 直接从内存返回 JSON，不再写临时文件到根目录
+    from fastapi.responses import Response
+    content = json.dumps(combined, ensure_ascii=False, indent=4)
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=firefly_accounts.json"},
+    )
+
+
+# Mount static frontend
+os.makedirs("static", exist_ok=True)
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

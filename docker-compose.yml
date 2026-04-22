@@ -1,0 +1,13 @@
+services:
+  adobe-firefly:
+    build: .
+    container_name: adobe-firefly
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: Asia/Shanghai
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    shm_size: "1gb"
+    restart: unless-stopped
