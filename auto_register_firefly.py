@@ -34,6 +34,7 @@ SHOW_BROWSER = os.getenv("SHOW_BROWSER", "0") == "1"
 PROXY_ENABLED = os.getenv("PROXY_ENABLED", "0") == "1"
 PROXY_SCHEME = os.getenv("PROXY_SCHEME", "http")
 PROXY_URL = os.getenv("PROXY_URL", "")
+API_PROXY_ENABLED = os.getenv("API_PROXY_ENABLED", "0") == "1"
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(DATA_DIR, "config.json"))
 
@@ -114,7 +115,9 @@ def build_playwright_proxy() -> dict | None:
         data["password"] = proxy["password"]
     return data
 
-def build_httpx_proxy_kwargs() -> dict:
+def build_api_httpx_proxy_kwargs() -> dict:
+    if not API_PROXY_ENABLED:
+        return {}
     proxy = get_proxy_config()
     if not proxy:
         return {}
@@ -127,6 +130,8 @@ def build_httpx_proxy_kwargs() -> dict:
 
 def open_url_with_proxy(request, timeout=60):
     import urllib.request
+    if not API_PROXY_ENABLED:
+        return urllib.request.urlopen(request, timeout=timeout)
     proxy = get_proxy_config()
     if not proxy or proxy["scheme"] == "socks5":
         return urllib.request.urlopen(request, timeout=timeout)
@@ -710,7 +715,7 @@ class TempMail:
             base_url=API_BASE,
             headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
             timeout=30.0,
-            **build_httpx_proxy_kwargs(),
+            **build_api_httpx_proxy_kwargs(),
         )
         self.email_id = None
         self.address = None
@@ -732,15 +737,27 @@ class TempMail:
     async def create(self) -> str:
         domain = self._pick_random_domain()
         prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        r = await self.client.post("/emails/generate", json={
-            "name": prefix, "expiryTime": 3600000, "domain": domain,
-        })
-        r.raise_for_status()
-        data = r.json()
-        self.email_id = data["id"]
-        self.address = data["email"]
-        log(f"📬 临时邮箱: {self.address}")
-        return self.address
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                r = await self.client.post("/emails/generate", json={
+                    "name": prefix, "expiryTime": 3600000, "domain": domain,
+                })
+                r.raise_for_status()
+                data = r.json()
+                self.email_id = data["id"]
+                self.address = data["email"]
+                log(f"📬 临时邮箱: {self.address}")
+                return self.address
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError) as e:
+                last_error = e
+                if attempt < 3:
+                    delay = attempt * 2
+                    log(f"  ⚠️ 临时邮箱创建失败，第 {attempt}/3 次: {type(e).__name__}，{delay}s 后重试")
+                    await asyncio.sleep(delay)
+                else:
+                    break
+        raise RuntimeError(f"临时邮箱创建失败，已重试 3 次: {last_error}")
 
     async def wait_for_code(self, max_wait=120, interval=5) -> str | None:
         log(f"⏳ 等待验证邮件 (最长 {max_wait}s)...")
@@ -870,7 +887,12 @@ async def main():
     # ── Step 0: 生成临时邮箱 ──
     log("━" * 50)
     log("Step 0: 生成临时邮箱")
-    email_addr = await mail.create()
+    try:
+        email_addr = await mail.create()
+    except Exception as e:
+        log(f"❌ 临时邮箱创建失败，任务结束: {e}")
+        await mail.close()
+        return
 
     async with async_playwright() as p:
         # Use persistent context to load the YesCaptcha extension
