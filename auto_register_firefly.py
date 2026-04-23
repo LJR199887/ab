@@ -845,6 +845,58 @@ async def click_any(page: Page, selectors: list) -> bool:
             continue
     return False
 
+async def collect_core_cookies(ctx: BrowserContext, cookie_keys: list[str]) -> dict:
+    all_cookies = await ctx.cookies([
+        "https://firefly.adobe.com",
+        "https://account.adobe.com",
+        "https://auth.services.adobe.com",
+        "https://www.adobe.com",
+        "https://adobeid-na1.services.adobe.com",
+        "https://ims-na1.adobelogin.com",
+    ])
+    if not all_cookies:
+        all_cookies = await ctx.cookies()
+
+    cookie_by_name = {}
+    for c in all_cookies:
+        if c["name"] in cookie_keys and c.get("value") and c["name"] not in cookie_by_name:
+            cookie_by_name[c["name"]] = c
+    return cookie_by_name
+
+async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie_keys: list[str], timeout_seconds: int = 20) -> dict:
+    log("Step 7: 进入 Firefly 页面补齐 Cookie")
+    try:
+        log("  → 打开 Firefly 首页")
+        await page.goto("https://firefly.adobe.com", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(5000)
+    except Exception as e:
+        log(f"  ⚠️ 打开 Firefly 首页失败，继续尝试读取 Cookie: {e}")
+
+    refresh_done = False
+    for attempt in range(1, max(2, timeout_seconds // 2) + 1):
+        cookie_by_name = await collect_core_cookies(ctx, cookie_keys)
+        found_keys = [key for key in cookie_keys if key in cookie_by_name]
+        missing_keys = [key for key in cookie_keys if key not in cookie_by_name]
+        if not missing_keys:
+            log(f"  ✅ 已补齐完整 Cookie ({len(found_keys)}/7)")
+            return cookie_by_name
+
+        log(f"  ⏳ 第 {attempt} 次检查: 已有 {len(found_keys)}/7，缺少: {', '.join(missing_keys)}")
+        if "fg" in missing_keys and not refresh_done:
+            try:
+                log("  → 刷新 Firefly 页面，等待补写 fg")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+                refresh_done = True
+                continue
+            except Exception as e:
+                log(f"  ⚠️ 刷新 Firefly 页面失败: {e}")
+                refresh_done = True
+
+        await page.wait_for_timeout(2000)
+
+    return await collect_core_cookies(ctx, cookie_keys)
+
 
 # ════════════════════════ 注册页面 URL ════════════════════════
 
@@ -1185,34 +1237,21 @@ async def main():
             # Step 7: 导出 Cookie
             # ══════════════════════════════════════
             log("━" * 50)
-            log("Step 7: 导出 Cookie")
             AUTH_COOKIE_KEYS = [
                 'ims_sid', 'aux_sid', 'fg', 'relay', 'ftrset',
                 'filter-profile-map', 'filter-profile-map-permanent',
             ]
             try:
-                all_cookies = await ctx.cookies([
-                    "https://firefly.adobe.com",
-                    "https://account.adobe.com",
-                    "https://auth.services.adobe.com",
-                    "https://www.adobe.com",
-                    "https://adobeid-na1.services.adobe.com",
-                    "https://ims-na1.adobelogin.com",
-                ])
-                # 如果指定域名没拿到，尝试获取所有 cookie
-                if not all_cookies:
-                    log("  ⚠️ 指定域名无 Cookie，尝试获取全部...")
-                    all_cookies = await ctx.cookies()
-                if all_cookies:
-                    # 只保留核心会话 Cookie
-                    auth_cookies = [c for c in all_cookies if c['name'] in AUTH_COOKIE_KEYS]
-                    # 去重
-                    seen = set()
-                    unique = []
-                    for c in auth_cookies:
-                        if c['name'] not in seen:
-                            seen.add(c['name'])
-                            unique.append(c)
+                cookie_by_name = await wait_for_complete_core_cookies(ctx, main_page, AUTH_COOKIE_KEYS, timeout_seconds=24)
+                if cookie_by_name:
+                    missing_keys = [key for key in AUTH_COOKIE_KEYS if key not in cookie_by_name]
+                    if missing_keys:
+                        found_keys = [key for key in AUTH_COOKIE_KEYS if key in cookie_by_name]
+                        log(f"  ❌ Cookie 不完整，缺少 {len(missing_keys)} 个核心字段: {', '.join(missing_keys)}")
+                        log(f"  ℹ️ 当前仅获取到 {len(found_keys)}/7: {', '.join(found_keys) if found_keys else '无'}")
+                        return
+
+                    unique = [cookie_by_name[key] for key in AUTH_COOKIE_KEYS]
 
                     cookie_header = "; ".join(
                         f"{c['name']}={c['value']}" for c in unique
@@ -1231,7 +1270,7 @@ async def main():
                     }
                     with open(cookie_file, "w", encoding="utf-8") as f:
                         json.dump(cookie_data, f, ensure_ascii=False, indent=4)
-                    log(f"  🍪 已导出 {len(unique)} 个核心 Cookie")
+                    log(f"  🍪 已导出完整核心 Cookie ({len(unique)}/7)")
                     log(f"  📁 文件: {cookie_file}")
                 else:
                     log("  ❌ 未获取到 Cookie，注册失败")

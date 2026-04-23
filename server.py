@@ -498,10 +498,10 @@ async def execute_single_worker(task: Task, worker_index: int):
         if os.path.exists(expected_cookie_file):
             task.completed += 1
             task.result_files.append(expected_cookie_file)
-            await task_manager.broadcast(f"{prefix} ✅ 注册成功！(Cookie 已导出)")
+            await task_manager.broadcast(f"{prefix} ✅ 注册成功！(已导出完整 7 项 Cookie)")
         else:
             task.failed += 1
-            await task_manager.broadcast(f"{prefix} ❌ 失败 (未获取到 Cookie)")
+            await task_manager.broadcast(f"{prefix} ❌ 失败 (未导出完整 7 项 Cookie)")
     except asyncio.CancelledError:
         try:
             process.terminate()
