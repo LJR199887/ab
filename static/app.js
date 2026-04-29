@@ -1,6 +1,7 @@
 document.addEventListener("DOMContentLoaded", () => {
     // ─── Elements ───
     const startBtn = document.getElementById("start-task-btn");
+    const taskNameInput = document.getElementById("task_name");
     const qtyInput = document.getElementById("task_qty");
     const taskStatus = document.getElementById("task-status");
     const taskListEl = document.getElementById("task-list");
@@ -55,6 +56,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const qty = parseInt(qtyInput.value) || 1;
         const conc = parseInt(concurrencyInput.value) || 1;
         const showBrowser = showBrowserCb.checked;
+        const taskName = (taskNameInput.value || "").trim();
 
         startBtn.disabled = true;
         startBtn.textContent = "加入中...";
@@ -62,14 +64,14 @@ document.addEventListener("DOMContentLoaded", () => {
         fetch("/api/tasks", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ quantity: qty, concurrency: conc, show_browser: showBrowser })
+            body: JSON.stringify({ name: taskName, quantity: qty, concurrency: conc, show_browser: showBrowser })
         }).then(r => r.json()).then(data => {
             startBtn.disabled = false;
             startBtn.textContent = "加入队列";
             taskStatus.style.color = "var(--success)";
-            taskStatus.textContent = `✅ 任务已创建 (${data.quantity}个, 并发${data.concurrency})`;
+            taskStatus.textContent = `✅ ${data.name} 已创建 (${data.quantity}个, 并发${data.concurrency})`;
             setTimeout(() => taskStatus.textContent = "", 3000);
-            appendLog(`系统: 任务 #${data.id} 已加入队列 (${data.quantity}个注册, 并发${data.concurrency})`, "sys");
+            appendLog(`系统: ${data.name} 已加入队列 (#${data.id}, ${data.quantity}个注册, 并发${data.concurrency})`, "sys");
             refreshTaskList();
         }).catch(() => {
             startBtn.disabled = false;
@@ -122,8 +124,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     return `
                         <div class="task-item${activeClass}" data-id="${t.id}" style="cursor: pointer;">
                             <div class="task-left">
-                                <span class="task-id">任务 #${t.id}</span>
-                                <span class="task-meta">${t.created_at} · ${t.quantity}个 · 并发${t.concurrency}</span>
+                                <span class="task-id">${t.name || `任务 #${t.id}`}</span>
+                                <span class="task-meta">#${t.id} · ${t.created_at} · ${t.quantity}个 · 并发${t.concurrency}</span>
                             </div>
                             <div class="task-right">
                                 <div class="task-counts">

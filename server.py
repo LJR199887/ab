@@ -208,15 +208,16 @@ config = load_config()
 
 # ─── Task Management ───
 class Task:
-    def __init__(self, task_id, quantity, concurrency=1, show_browser=False):
+    def __init__(self, task_id, quantity, concurrency=1, show_browser=False, name=""):
         self.id = task_id
         self.quantity = quantity
         self.concurrency = concurrency
         self.show_browser = show_browser
+        self.name = (name or "").strip() or f"任务 #{task_id}"
         self.status = "pending"     # pending -> running -> stopping -> completed/stopped
         self.completed = 0
         self.failed = 0
-        self.created_at = datetime.now().strftime("%H:%M:%S")
+        self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
         self.asyncio_tasks = []
 
@@ -226,6 +227,7 @@ class Task:
             "quantity": self.quantity,
             "concurrency": self.concurrency,
             "show_browser": self.show_browser,
+            "name": self.name,
             "status": self.status,
             "completed": self.completed,
             "failed": self.failed,
@@ -259,7 +261,13 @@ class TaskManager:
                     data = json.load(f)
                     self.next_id = data.get("next_id", 1)
                     for t_data in data.get("tasks", []):
-                        t = Task(t_data["id"], t_data["quantity"], t_data.get("concurrency", 1), t_data.get("show_browser", False))
+                        t = Task(
+                            t_data["id"],
+                            t_data["quantity"],
+                            t_data.get("concurrency", 1),
+                            t_data.get("show_browser", False),
+                            t_data.get("name", ""),
+                        )
                         t.status = t_data["status"]
                         t.completed = t_data.get("completed", 0)
                         t.failed = t_data.get("failed", 0)
@@ -272,8 +280,8 @@ class TaskManager:
             except Exception as e:
                 print(f"Failed to load tasks: {e}")
 
-    def create_task(self, quantity, concurrency=1, show_browser=False) -> Task:
-        task = Task(self.next_id, quantity, concurrency, show_browser)
+    def create_task(self, quantity, concurrency=1, show_browser=False, name="") -> Task:
+        task = Task(self.next_id, quantity, concurrency, show_browser, name)
         self.tasks[self.next_id] = task
         self.next_id += 1
         return task
@@ -347,6 +355,7 @@ class TaskStart(BaseModel):
     quantity: int
     concurrency: int = 1
     show_browser: bool = False
+    name: str = ""
 
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
@@ -427,7 +436,7 @@ async def get_config():
 @app.post("/api/tasks")
 async def start_task(item: TaskStart):
     conc = max(1, min(item.concurrency, 10))
-    task = task_manager.create_task(item.quantity, conc, item.show_browser)
+    task = task_manager.create_task(item.quantity, conc, item.show_browser, item.name)
     await task_manager.queue.put(task)
 
     # Ensure queue worker is running
