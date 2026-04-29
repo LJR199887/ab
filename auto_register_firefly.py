@@ -897,6 +897,49 @@ async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie
 
     return await collect_core_cookies(ctx, cookie_keys)
 
+async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_seconds: int = 30) -> bool:
+    log("Step 6.5: 等待 Adobe 登录态落地")
+    session_keys = ["ims_sid", "aux_sid"]
+    reload_done = False
+    firefly_opened = False
+
+    for attempt in range(1, max(2, timeout_seconds // 2) + 1):
+        cookie_by_name = await collect_core_cookies(ctx, session_keys)
+        found_keys = [key for key in session_keys if key in cookie_by_name]
+        missing_keys = [key for key in session_keys if key not in cookie_by_name]
+        if not missing_keys:
+            log(f"  ✅ Adobe 主登录态已就绪 ({', '.join(found_keys)})")
+            return True
+
+        short_url = page.url[:80] if page.url else ""
+        log(f"  ⏳ 第 {attempt} 次检查: 缺少 {', '.join(missing_keys)} | 当前页: {short_url}")
+
+        if "challenge/email-verification" in page.url and not reload_done:
+            try:
+                log("  → 仍停留在验证页，刷新当前页面以继续 SSO")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(4000)
+                reload_done = True
+                continue
+            except Exception as e:
+                log(f"  ⚠️ 刷新验证页失败: {e}")
+                reload_done = True
+
+        if attempt >= 3 and not firefly_opened:
+            try:
+                log("  → 主动打开 Firefly 首页，触发登录态落地")
+                await page.goto("https://firefly.adobe.com", wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(4000)
+                firefly_opened = True
+                continue
+            except Exception as e:
+                log(f"  ⚠️ 打开 Firefly 首页失败: {e}")
+                firefly_opened = True
+
+        await page.wait_for_timeout(2000)
+
+    return False
+
 
 # ════════════════════════ 注册页面 URL ════════════════════════
 
@@ -1214,6 +1257,11 @@ async def main():
                 else:
                     # 即使没跳转也等够 8 秒
                     await asyncio.sleep(5)
+
+                session_ready = await wait_for_login_session(ctx, main_page, timeout_seconds=30)
+                if not session_ready:
+                    log("❌ Adobe 主登录态未完成落地，注册失败")
+                    return
 
             else:
                 log("❌ 验证邮件超时，注册失败")
