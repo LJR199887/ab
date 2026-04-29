@@ -3,10 +3,11 @@ import json
 import asyncio
 import subprocess
 import base64
+import re
 import socket
 import ssl
 from datetime import datetime
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -203,6 +204,14 @@ def resolve_data_file(path: str) -> str:
     if os.path.exists(data_path):
         return data_path
     return path
+
+def sanitize_filename(name: str, fallback: str = "导出文件") -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    return cleaned[:80] if cleaned else fallback
+
+def export_timestamp() -> str:
+    return datetime.now().strftime("%m-%d_%H-%M")
 
 config = load_config()
 
@@ -564,8 +573,10 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/api/export")
 async def export_results(ids: str = ""):
     # Filter by task IDs if provided
+    export_filename = ""
     if ids:
         target_ids = set(int(x) for x in ids.split(",") if x.strip().isdigit())
+        selected_tasks = [t for t in task_manager.tasks.values() if t.id in target_ids]
         result_files = []
         for t in task_manager.tasks.values():
             if t.id in target_ids:
@@ -575,7 +586,13 @@ async def export_results(ids: str = ""):
                     # Fallback for older tasks before result_files was saved to JSON
                     import glob
                     result_files.extend(glob.glob(os.path.join(SCREENSHOT_DIR, f"cookie_task{t.id}_*.json")))
+        if len(selected_tasks) == 1:
+            task = selected_tasks[0]
+            export_filename = f"{sanitize_filename(task.name, f'任务_{task.id}')}_#{task.id}.json"
+        else:
+            export_filename = f"批量导出_{len(selected_tasks)}个任务_{export_timestamp()}.json"
     else:
+        selected_tasks = list(task_manager.tasks.values())
         result_files = []
         for t in task_manager.tasks.values():
             if t.result_files:
@@ -583,6 +600,7 @@ async def export_results(ids: str = ""):
             else:
                 import glob
                 result_files.extend(glob.glob(os.path.join(SCREENSHOT_DIR, f"cookie_task{t.id}_*.json")))
+        export_filename = f"全部任务_{export_timestamp()}.json"
 
     combined = []
     for f in result_files:
@@ -599,10 +617,14 @@ async def export_results(ids: str = ""):
     # 直接从内存返回 JSON，不再写临时文件到根目录
     from fastapi.responses import Response
     content = json.dumps(combined, ensure_ascii=False, indent=4)
+    if not export_filename:
+        export_filename = f"批量导出_{len(selected_tasks)}个任务_{export_timestamp()}.json"
     return Response(
         content=content.encode("utf-8"),
         media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=firefly_accounts.json"},
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(export_filename)}"
+        },
     )
 
 
