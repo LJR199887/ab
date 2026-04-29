@@ -863,16 +863,31 @@ async def collect_core_cookies(ctx: BrowserContext, cookie_keys: list[str]) -> d
             cookie_by_name[c["name"]] = c
     return cookie_by_name
 
+def is_auth_success_callback(url: str) -> bool:
+    if not url:
+        return False
+    return (
+        "auth-light.identity.adobe.com/wrapper-popup-helper/index.html" in url
+        and "#access_token=" in url
+    )
+
 async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie_keys: list[str], timeout_seconds: int = 20) -> dict:
     log("Step 7: 进入 Firefly 页面补齐 Cookie")
+    warmup_urls = [
+        ("Adobe 首页", "https://www.adobe.com"),
+        ("Adobe 账户页", "https://account.adobe.com"),
+        ("Firefly 首页", "https://firefly.adobe.com"),
+    ]
     try:
-        log("  → 打开 Firefly 首页")
-        await page.goto("https://firefly.adobe.com", wait_until="domcontentloaded", timeout=30000)
+        label, url = warmup_urls[0]
+        log(f"  → 打开 {label}")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(5000)
     except Exception as e:
         log(f"  ⚠️ 打开 Firefly 首页失败，继续尝试读取 Cookie: {e}")
 
     refresh_done = False
+    warmup_index = 1
     for attempt in range(1, max(2, timeout_seconds // 2) + 1):
         cookie_by_name = await collect_core_cookies(ctx, cookie_keys)
         found_keys = [key for key in cookie_keys if key in cookie_by_name]
@@ -893,6 +908,18 @@ async def wait_for_complete_core_cookies(ctx: BrowserContext, page: Page, cookie
                 log(f"  ⚠️ 刷新 Firefly 页面失败: {e}")
                 refresh_done = True
 
+        if warmup_index < len(warmup_urls) and attempt in (3, 6):
+            try:
+                label, url = warmup_urls[warmup_index]
+                log(f"  → 打开 {label}，尝试补齐剩余 Cookie")
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(4000)
+                warmup_index += 1
+                continue
+            except Exception as e:
+                log(f"  ⚠️ 打开 {warmup_urls[warmup_index][0]} 失败: {e}")
+                warmup_index += 1
+
         await page.wait_for_timeout(2000)
 
     return await collect_core_cookies(ctx, cookie_keys)
@@ -901,9 +928,23 @@ async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_second
     log("Step 6.5: 等待 Adobe 登录态落地")
     session_keys = ["ims_sid", "aux_sid"]
     reload_done = False
-    firefly_opened = False
+    warmup_urls = [
+        ("Adobe 首页", "https://www.adobe.com"),
+        ("Adobe 账户页", "https://account.adobe.com"),
+        ("Firefly 首页", "https://firefly.adobe.com"),
+    ]
+    warmup_index = 0
 
     for attempt in range(1, max(2, timeout_seconds // 2) + 1):
+        if is_auth_success_callback(page.url):
+            try:
+                log("  ✅ 检测到 wrapper-popup-helper 回调，认证已成功")
+                log("  → 直接进入 Firefly 首页，触发 Adobe 会话落地")
+                await page.goto("https://firefly.adobe.com", wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(4000)
+            except Exception as e:
+                log(f"  ⚠️ 回调后打开 Firefly 首页失败: {e}")
+
         cookie_by_name = await collect_core_cookies(ctx, session_keys)
         found_keys = [key for key in session_keys if key in cookie_by_name]
         missing_keys = [key for key in session_keys if key not in cookie_by_name]
@@ -925,16 +966,17 @@ async def wait_for_login_session(ctx: BrowserContext, page: Page, timeout_second
                 log(f"  ⚠️ 刷新验证页失败: {e}")
                 reload_done = True
 
-        if attempt >= 3 and not firefly_opened:
+        if attempt >= 3 and warmup_index < len(warmup_urls):
             try:
-                log("  → 主动打开 Firefly 首页，触发登录态落地")
-                await page.goto("https://firefly.adobe.com", wait_until="domcontentloaded", timeout=30000)
+                label, url = warmup_urls[warmup_index]
+                log(f"  → 主动打开 {label}，触发登录态落地")
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(4000)
-                firefly_opened = True
+                warmup_index += 1
                 continue
             except Exception as e:
-                log(f"  ⚠️ 打开 Firefly 首页失败: {e}")
-                firefly_opened = True
+                log(f"  ⚠️ 打开 {warmup_urls[warmup_index][0]} 失败: {e}")
+                warmup_index += 1
 
         await page.wait_for_timeout(2000)
 
@@ -1253,6 +1295,10 @@ async def main():
                     if main_page.url != pre_url:
                         log(f"  🔄 页面已跳转: {main_page.url[:60]}")
                         await asyncio.sleep(3)  # 跳转后再等 3 秒确保 cookie 写入
+                        break
+                    if is_auth_success_callback(main_page.url):
+                        log("  ✅ 检测到 wrapper-popup-helper 成功回调")
+                        await asyncio.sleep(2)
                         break
                 else:
                     # 即使没跳转也等够 8 秒
