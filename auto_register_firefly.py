@@ -10,8 +10,10 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
+from contextlib import suppress
 from datetime import datetime
 from urllib.parse import unquote, urlsplit
 
@@ -164,6 +166,23 @@ BIRTH_YEAR = os.getenv("BIRTH_YEAR", str(random.randint(1990, 2000)))
 BIRTH_MONTH = os.getenv("BIRTH_MONTH", str(random.randint(1, 12)))
 SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", os.path.join(DATA_DIR, "screenshots"))
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+async def optimize_browser_context(ctx: BrowserContext, page: Page):
+    with suppress(Exception):
+        await ctx.clear_cookies()
+    with suppress(Exception):
+        await ctx.clear_permissions()
+    cdp = None
+    with suppress(Exception):
+        cdp = await ctx.new_cdp_session(page)
+        await cdp.send("Network.enable")
+        await cdp.send("Network.clearBrowserCookies")
+        await cdp.send("Network.clearBrowserCache")
+        await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+    if cdp:
+        with suppress(Exception):
+            await cdp.detach()
 
 
 # ════════════════════════ 浏览器指纹随机化 ════════════════════════
@@ -1043,6 +1062,7 @@ async def main():
             import uuid
             unique_id = uuid.uuid4().hex[:12]
             user_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"chrome_profile_{unique_id}")
+        shutil.rmtree(user_data_dir, ignore_errors=True)
         os.makedirs(user_data_dir, exist_ok=True)
         ctx = None
         main_page = None
@@ -1063,6 +1083,16 @@ async def main():
             "--no-sandbox",
             "--disable-infobars",
             "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-default-apps",
+            "--disable-renderer-backgrounding",
+            "--metrics-recording-only",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--aggressive-cache-discard",
+            "--disk-cache-size=1",
+            "--media-cache-size=1",
             "--window-size=1280,800",
         ]
         if not SHOW_BROWSER:
@@ -1115,6 +1145,8 @@ async def main():
             await extra_page.close()
         main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         main_page.set_default_timeout(30000)
+        await optimize_browser_context(ctx, main_page)
+        log("  Browser context optimized for clean startup")
 
         try:
             # ══════════════════════════════════════

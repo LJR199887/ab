@@ -549,6 +549,15 @@ async def stream_process_output(process: asyncio.subprocess.Process, prefix: str
             await task_manager.broadcast(f"{prefix} {decoded}")
 
 
+async def finalize_output_task(output_task: asyncio.Task):
+    try:
+        await asyncio.wait_for(output_task, timeout=5)
+    except asyncio.TimeoutError:
+        output_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await output_task
+
+
 async def execute_single_worker(task: Task, worker_index: int):
     cleaned = cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
     if cleaned:
@@ -612,8 +621,7 @@ async def execute_single_worker(task: Task, worker_index: int):
         await task_manager.broadcast(f"{prefix} 🛑 操作已停止")
         raise
     finally:
-        with suppress(asyncio.CancelledError):
-            await output_task
+        await finalize_output_task(output_task)
         task.active_processes.pop(worker_index, None)
         task.active_profiles.pop(worker_index, None)
         cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
