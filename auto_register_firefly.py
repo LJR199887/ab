@@ -39,6 +39,7 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(DATA_DIR, "config.json"))
 BROWSER_LAUNCH_TIMEOUT_SECONDS = max(30, int(os.getenv("BROWSER_LAUNCH_TIMEOUT_SECONDS", "90")))
 USER_DATA_DIR = os.getenv("USER_DATA_DIR", "")
+SIGNUP_GOTO_TIMEOUT_MS = max(10000, int(os.getenv("SIGNUP_GOTO_TIMEOUT_MS", "50000")))
 
 import random
 import string
@@ -1121,7 +1122,24 @@ async def main():
             # ══════════════════════════════════════
             log("━" * 50)
             log("Step 1: 直接打开 Adobe 注册页面")
-            await main_page.goto(SIGNUP_URL, wait_until="domcontentloaded")
+            try:
+                await main_page.goto(
+                    SIGNUP_URL,
+                    wait_until="domcontentloaded",
+                    timeout=SIGNUP_GOTO_TIMEOUT_MS,
+                )
+            except PlaywrightTimeout:
+                log(f"  ⚠️ 注册页首次加载超时（>{SIGNUP_GOTO_TIMEOUT_MS // 1000} 秒），正在重试 1/1")
+                try:
+                    await main_page.goto("about:blank", wait_until="load", timeout=10000)
+                except Exception:
+                    pass
+                await main_page.wait_for_timeout(1000)
+                await main_page.goto(
+                    SIGNUP_URL,
+                    wait_until="domcontentloaded",
+                    timeout=SIGNUP_GOTO_TIMEOUT_MS,
+                )
             await main_page.wait_for_timeout(5000)
             await shot(main_page, "signup_page")
             log("✅ 注册页面已加载")
