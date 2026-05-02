@@ -1466,7 +1466,6 @@ async def main():
             if ctx:
                 await ctx.close()
             # Clean up temporary profile directory
-            import shutil
             try:
                 shutil.rmtree(user_data_dir, ignore_errors=True)
             except Exception:
