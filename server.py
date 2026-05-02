@@ -6,6 +6,10 @@ import base64
 import re
 import socket
 import ssl
+import sys
+import shutil
+import uuid
+from contextlib import suppress
 from datetime import datetime
 from urllib.parse import quote, unquote, urlsplit
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -18,7 +22,8 @@ import httpx
 app = FastAPI()
 
 # Config storage
-DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("DATA_DIR", APP_DIR)
 SCREENSHOT_DIR = os.path.join(DATA_DIR, "screenshots")
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
@@ -34,6 +39,10 @@ DEFAULT_CONFIG = {
     "proxy_scheme": "http",
     "proxy_url": "",
 }
+
+WORKER_TIMEOUT_SECONDS = max(180, int(os.getenv("WORKER_TIMEOUT_SECONDS", "900")))
+STALE_PROFILE_SECONDS = max(300, int(os.getenv("STALE_PROFILE_SECONDS", "1800")))
+PROFILE_PREFIX = "chrome_profile_"
 
 def normalize_proxy(proxy_url: str, proxy_scheme: str = "http") -> dict:
     raw = (proxy_url or "").strip()
@@ -229,6 +238,8 @@ class Task:
         self.created_at = datetime.now().strftime("%m-%d %H:%M")
         self.result_files = []
         self.asyncio_tasks = []
+        self.active_processes = {}
+        self.active_profiles = {}
 
     def to_dict(self):
         return {
@@ -244,6 +255,38 @@ class Task:
             "result_count": len(self.result_files),
             "result_files": self.result_files,
         }
+
+
+def collect_active_profile_paths(tasks: dict[int, "Task"]) -> set[str]:
+    active = set()
+    for task in tasks.values():
+        active.update(task.active_profiles.values())
+    return active
+
+
+def cleanup_stale_profiles(active_paths: set[str] | None = None) -> int:
+    active_paths = {os.path.abspath(path) for path in (active_paths or set())}
+    removed = 0
+    now = datetime.now().timestamp()
+
+    for entry in os.listdir(APP_DIR):
+        if not entry.startswith(PROFILE_PREFIX):
+            continue
+        path = os.path.abspath(os.path.join(APP_DIR, entry))
+        if path in active_paths or not os.path.isdir(path):
+            continue
+        try:
+            age_seconds = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age_seconds < STALE_PROFILE_SECONDS:
+            continue
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            removed += 1
+        except Exception:
+            continue
+    return removed
 
 class TaskManager:
     def __init__(self):
@@ -303,13 +346,19 @@ class TaskManager:
                 if t.status not in ("running", "pending"):
                     del self.tasks[tid]
 
-    def stop_tasks(self, ids: list[int]):
+    async def stop_tasks(self, ids: list[int]):
         for tid in ids:
             if tid in self.tasks:
                 t = self.tasks[tid]
-                if t.status in ("pending", "running"):
-                    # 设为 stopping：正在跑的 worker 继续跑完，等待中的 worker 不再启动
+                if t.status == "pending":
+                    t.status = "stopped"
+                elif t.status == "running":
                     t.status = "stopping"
+                    for async_task in list(t.asyncio_tasks):
+                        if not async_task.done():
+                            async_task.cancel()
+                    for process in list(t.active_processes.values()):
+                        await terminate_process(process)
 
     async def broadcast(self, message: str):
         if message == "__STATE_UPDATE__":
@@ -331,17 +380,21 @@ class TaskManager:
         if self._worker_running:
             return
         self._worker_running = True
-        while True:
-            task = await self.queue.get()
-            if task.status == "stopped":
-                self.queue.task_done()
-                continue
-            try:
-                await run_task(task)
-            except Exception as e:
-                await self.broadcast(f"❌ 任务 #{task.id} 异常: {e}")
-                task.status = "completed"
-            self.queue.task_done()
+        try:
+            while True:
+                task = await self.queue.get()
+                if task.status == "stopped":
+                    self.queue.task_done()
+                    continue
+                try:
+                    await run_task(task)
+                except Exception as e:
+                    await self.broadcast(f"❌ 任务 #{task.id} 异常: {e}")
+                    task.status = "completed"
+                finally:
+                    self.queue.task_done()
+        finally:
+            self._worker_running = False
 
 task_manager = TaskManager()
 
@@ -465,12 +518,42 @@ async def delete_tasks(req: TaskDeleteRequest):
 
 @app.post("/api/tasks/stop")
 async def stop_tasks(req: TaskDeleteRequest):
-    task_manager.stop_tasks(req.ids)
+    await task_manager.stop_tasks(req.ids)
     await task_manager.broadcast("__STATE_UPDATE__")
     return {"status": "ok", "stopped": len(req.ids)}
 
 # ─── Worker Logic ───
+async def terminate_process(process: asyncio.subprocess.Process | None):
+    if process is None or process.returncode is not None:
+        return
+    with suppress(ProcessLookupError):
+        process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+        return
+    except asyncio.TimeoutError:
+        pass
+    with suppress(ProcessLookupError):
+        process.kill()
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=5)
+
+
+async def stream_process_output(process: asyncio.subprocess.Process, prefix: str):
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        decoded = line.decode("utf-8", errors="ignore").strip()
+        if decoded:
+            await task_manager.broadcast(f"{prefix} {decoded}")
+
+
 async def execute_single_worker(task: Task, worker_index: int):
+    cleaned = cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
+    if cleaned:
+        await task_manager.broadcast(f"[任务#{task.id}-{worker_index}] 已清理 {cleaned} 个残留浏览器目录")
+
     env = os.environ.copy()
     env["API_KEY"] = config["api_key"]
     env["API_BASE"] = config["api_base"]
@@ -492,25 +575,28 @@ async def execute_single_worker(task: Task, worker_index: int):
     cookie_id = f"task{task.id}_w{worker_index}"
     env["COOKIE_ID"] = cookie_id
     expected_cookie_file = os.path.join(SCREENSHOT_DIR, f"cookie_{cookie_id}.json")
+    profile_id = f"{task.id}_{worker_index}_{uuid.uuid4().hex[:10]}"
+    user_data_dir = os.path.join(APP_DIR, f"{PROFILE_PREFIX}{profile_id}")
+    env["USER_DATA_DIR"] = user_data_dir
+    task.active_profiles[worker_index] = user_data_dir
 
     prefix = f"[任务#{task.id}-{worker_index}]"
 
     process = await asyncio.create_subprocess_exec(
-        "python", "-u", "auto_register_firefly.py",
+        sys.executable, "-u", "auto_register_firefly.py",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         env=env
     )
+    task.active_processes[worker_index] = process
+    output_task = asyncio.create_task(stream_process_output(process, prefix))
 
     try:
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode('utf-8', errors='ignore').strip()
-            await task_manager.broadcast(f"{prefix} {decoded}")
-
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=WORKER_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await task_manager.broadcast(f"{prefix} 运行超时，已强制结束浏览器和脚本")
+            await terminate_process(process)
 
         # 只检查该 worker 专属的 cookie 文件是否存在
         if os.path.exists(expected_cookie_file):
@@ -521,18 +607,23 @@ async def execute_single_worker(task: Task, worker_index: int):
             task.failed += 1
             await task_manager.broadcast(f"{prefix} ❌ 失败 (未导出完整 7 项 Cookie)")
     except asyncio.CancelledError:
-        try:
-            process.terminate()
-        except:
-            pass
+        await terminate_process(process)
         task.failed += 1
         await task_manager.broadcast(f"{prefix} 🛑 操作已停止")
         raise
     finally:
+        with suppress(asyncio.CancelledError):
+            await output_task
+        task.active_processes.pop(worker_index, None)
+        task.active_profiles.pop(worker_index, None)
+        cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
         await task_manager.broadcast("__STATE_UPDATE__")
 
 async def run_task(task: Task):
     task.status = "running"
+    task.asyncio_tasks = []
+    task.active_processes = {}
+    task.active_profiles = {}
     await task_manager.broadcast("__STATE_UPDATE__")
 
     sem = asyncio.Semaphore(task.concurrency)
@@ -548,6 +639,9 @@ async def run_task(task: Task):
     workers = [asyncio.create_task(wrapper(i)) for i in range(1, task.quantity + 1)]
     task.asyncio_tasks = workers
     await asyncio.gather(*workers, return_exceptions=True)
+    task.asyncio_tasks = []
+    task.active_processes = {}
+    task.active_profiles = {}
 
     if task.status == "stopping":
         task.status = "stopped"
@@ -631,6 +725,11 @@ async def export_results(ids: str = ""):
 # Mount static frontend
 os.makedirs("static", exist_ok=True)
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
+
+
+@app.on_event("startup")
+async def cleanup_profiles_on_startup():
+    cleanup_stale_profiles(collect_active_profile_paths(task_manager.tasks))
 
 if __name__ == "__main__":
     import uvicorn

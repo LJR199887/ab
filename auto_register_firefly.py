@@ -37,6 +37,8 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 API_PROXY_ENABLED = os.getenv("API_PROXY_ENABLED", "0") == "1"
 DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.getenv("CONFIG_FILE", os.path.join(DATA_DIR, "config.json"))
+BROWSER_LAUNCH_TIMEOUT_SECONDS = max(30, int(os.getenv("BROWSER_LAUNCH_TIMEOUT_SECONDS", "90")))
+USER_DATA_DIR = os.getenv("USER_DATA_DIR", "")
 
 import random
 import string
@@ -1034,10 +1036,15 @@ async def main():
     async with async_playwright() as p:
         # Use persistent context to load the YesCaptcha extension
         # Use UUID to guarantee unique profile dir (avoids PID collision)
-        import uuid
-        unique_id = uuid.uuid4().hex[:12]
-        user_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"chrome_profile_{unique_id}")
+        if USER_DATA_DIR:
+            user_data_dir = USER_DATA_DIR
+        else:
+            import uuid
+            unique_id = uuid.uuid4().hex[:12]
+            user_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"chrome_profile_{unique_id}")
         os.makedirs(user_data_dir, exist_ok=True)
+        ctx = None
+        main_page = None
 
         ext_path = os.path.abspath(YESCAPTCHA_EXT_DIR)
         has_ext = os.path.exists(os.path.join(ext_path, "manifest.json"))
@@ -1083,7 +1090,17 @@ async def main():
         if browser_proxy:
             launch_options["proxy"] = browser_proxy
 
-        ctx = await p.chromium.launch_persistent_context(user_data_dir, **launch_options)
+        try:
+            ctx = await asyncio.wait_for(
+                p.chromium.launch_persistent_context(user_data_dir, **launch_options),
+                timeout=BROWSER_LAUNCH_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            log(f"❌ 浏览器启动超时（>{BROWSER_LAUNCH_TIMEOUT_SECONDS} 秒），本次任务结束")
+            return
+        except Exception as e:
+            log(f"❌ 浏览器启动失败: {e}")
+            return
 
         # 注入指纹伪装脚本（在每个页面加载前执行）
         await ctx.add_init_script(fp["init_script"])
@@ -1396,7 +1413,8 @@ async def main():
                 pass
         finally:
             await mail.close()
-            await ctx.close()
+            if ctx:
+                await ctx.close()
             # Clean up temporary profile directory
             import shutil
             try:
