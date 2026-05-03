@@ -1102,29 +1102,57 @@ async def main():
         if browser_proxy:
             log(f"  🌐 浏览器代理: {browser_proxy['server']}")
 
-        launch_options = {
-            "headless": not SHOW_BROWSER,
-            "slow_mo": 200,
-            "args": launch_args,
-            "viewport": {"width": 1280, "height": 800},
-            "locale": fp["locale"],
-            "timezone_id": fp["timezone"],
-            "color_scheme": fp["color_scheme"],
-            "user_agent": fp["user_agent"],
-        }
-        if browser_proxy:
-            launch_options["proxy"] = browser_proxy
+        launch_variants = [
+            {
+                "label": "new-headless" if not SHOW_BROWSER else "headed",
+                "headless": False,
+                "extra_args": ["--headless=new"] if not SHOW_BROWSER else [],
+            }
+        ]
+        if not SHOW_BROWSER:
+            launch_variants.append({
+                "label": "legacy-headless",
+                "headless": True,
+                "extra_args": [],
+            })
 
-        try:
-            ctx = await asyncio.wait_for(
-                p.chromium.launch_persistent_context(user_data_dir, **launch_options),
-                timeout=BROWSER_LAUNCH_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            log(f"❌ 浏览器启动超时（>{BROWSER_LAUNCH_TIMEOUT_SECONDS} 秒），本次任务结束")
-            return
-        except Exception as e:
-            log(f"❌ 浏览器启动失败: {e}")
+        launch_error = None
+        for idx, variant in enumerate(launch_variants, start=1):
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+            os.makedirs(user_data_dir, exist_ok=True)
+            variant_args = launch_args + variant["extra_args"]
+            launch_options = {
+                "headless": variant["headless"],
+                "slow_mo": 200,
+                "args": variant_args,
+                "viewport": {"width": 1280, "height": 800},
+                "locale": fp["locale"],
+                "timezone_id": fp["timezone"],
+                "color_scheme": fp["color_scheme"],
+                "user_agent": fp["user_agent"],
+            }
+            if browser_proxy:
+                launch_options["proxy"] = browser_proxy
+
+            try:
+                if len(launch_variants) > 1:
+                    log(f"  🚀 尝试启动浏览器模式 {idx}/{len(launch_variants)}: {variant['label']}")
+                ctx = await asyncio.wait_for(
+                    p.chromium.launch_persistent_context(user_data_dir, **launch_options),
+                    timeout=BROWSER_LAUNCH_TIMEOUT_SECONDS,
+                )
+                launch_error = None
+                break
+            except asyncio.TimeoutError:
+                launch_error = f"浏览器启动超时（>{BROWSER_LAUNCH_TIMEOUT_SECONDS} 秒）"
+            except Exception as e:
+                launch_error = str(e)
+
+            if idx < len(launch_variants):
+                log(f"  ⚠️ 浏览器模式 {variant['label']} 启动失败，切换备用模式: {launch_error}")
+
+        if ctx is None:
+            log(f"❌ 浏览器启动失败: {launch_error}")
             return
 
         # 注入指纹伪装脚本（在每个页面加载前执行）
