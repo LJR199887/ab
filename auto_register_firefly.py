@@ -1138,8 +1138,6 @@ async def main():
             await extra_page.close()
         main_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         main_page.set_default_timeout(30000)
-        await optimize_browser_context(ctx, main_page)
-        log("  Browser context optimized for clean startup")
 
         try:
             # ══════════════════════════════════════
