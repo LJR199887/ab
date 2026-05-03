@@ -13,7 +13,6 @@ import re
 import shutil
 import sys
 import time
-from contextlib import suppress
 from datetime import datetime
 from urllib.parse import unquote, urlsplit
 
@@ -166,23 +165,6 @@ BIRTH_YEAR = os.getenv("BIRTH_YEAR", str(random.randint(1990, 2000)))
 BIRTH_MONTH = os.getenv("BIRTH_MONTH", str(random.randint(1, 12)))
 SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", os.path.join(DATA_DIR, "screenshots"))
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-
-async def optimize_browser_context(ctx: BrowserContext, page: Page):
-    with suppress(Exception):
-        await ctx.clear_cookies()
-    with suppress(Exception):
-        await ctx.clear_permissions()
-    cdp = None
-    with suppress(Exception):
-        cdp = await ctx.new_cdp_session(page)
-        await cdp.send("Network.enable")
-        await cdp.send("Network.clearBrowserCookies")
-        await cdp.send("Network.clearBrowserCache")
-        await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
-    if cdp:
-        with suppress(Exception):
-            await cdp.detach()
 
 
 # ════════════════════════ 浏览器指纹随机化 ════════════════════════
@@ -1081,19 +1063,8 @@ async def main():
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--disable-gpu",
             "--disable-infobars",
             "--disable-dev-shm-usage",
-            "--disable-background-networking",
-            "--disable-component-update",
-            "--disable-default-apps",
-            "--disable-renderer-backgrounding",
-            "--metrics-recording-only",
-            "--password-store=basic",
-            "--use-mock-keychain",
-            "--aggressive-cache-discard",
-            "--disk-cache-size=1",
-            "--media-cache-size=1",
             "--window-size=1280,800",
         ]
         # 移除原有的 YesCaptcha 扩展加载逻辑，改用纯 API 方案
