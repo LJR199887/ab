@@ -12,14 +12,16 @@ import uuid
 from contextlib import suppress
 from datetime import datetime
 from urllib.parse import quote, unquote, urlsplit
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, JSONResponse
 import glob
 import httpx
 
 app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "firefly-admin-session-secret"), max_age=60 * 60 * 12)
 
 # Config storage
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -43,6 +45,43 @@ DEFAULT_CONFIG = {
 WORKER_TIMEOUT_SECONDS = max(180, int(os.getenv("WORKER_TIMEOUT_SECONDS", "900")))
 STALE_PROFILE_SECONDS = max(300, int(os.getenv("STALE_PROFILE_SECONDS", "1800")))
 PROFILE_PREFIX = "chrome_profile_"
+ADMIN_USERNAME = "link"
+ADMIN_PASSWORD = "199887"
+LOGIN_PATH = "/login"
+LOGIN_API_PATH = "/api/login"
+LOGOUT_API_PATH = "/api/logout"
+PUBLIC_PATHS = {
+    LOGIN_PATH,
+    LOGIN_API_PATH,
+    LOGOUT_API_PATH,
+    "/favicon.ico",
+    "/style.css",
+    "/app.js",
+    "/login.html",
+}
+
+
+def is_authenticated(request: Request) -> bool:
+    session = request.scope.get("session")
+    if not isinstance(session, dict):
+        return False
+    return bool(session.get("admin_authenticated"))
+
+
+@app.middleware("http")
+async def require_admin_login(request: Request, call_next):
+    path = request.url.path
+    if path in PUBLIC_PATHS:
+        if path == LOGIN_PATH and is_authenticated(request):
+            return RedirectResponse(url="/", status_code=302)
+        return await call_next(request)
+
+    if not is_authenticated(request):
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return RedirectResponse(url=LOGIN_PATH, status_code=302)
+
+    return await call_next(request)
 
 def normalize_proxy(proxy_url: str, proxy_scheme: str = "http") -> dict:
     raw = (proxy_url or "").strip()
@@ -422,6 +461,28 @@ class TaskStart(BaseModel):
 class TaskDeleteRequest(BaseModel):
     ids: list[int]
 
+# ─── Auth Endpoints ───
+@app.get(LOGIN_PATH)
+async def login_page():
+    return FileResponse(os.path.join(APP_DIR, "static", "login.html"))
+
+
+@app.post(LOGIN_API_PATH)
+async def login(data: dict, request: Request):
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if username != ADMIN_USERNAME or password != ADMIN_PASSWORD:
+        return JSONResponse(status_code=401, content={"ok": False, "message": "账号或密码错误"})
+    request.session["admin_authenticated"] = True
+    return {"ok": True}
+
+
+@app.post(LOGOUT_API_PATH)
+async def logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
 # ─── Config Endpoints ───
 @app.post("/api/config")
 async def update_config(item: ConfigUpdate):
@@ -662,6 +723,9 @@ async def run_task(task: Task):
 # ─── WebSocket ───
 @app.websocket("/ws/logs")
 async def websocket_endpoint(websocket: WebSocket):
+    if not websocket.scope.get("session", {}).get("admin_authenticated"):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     task_manager.websockets.append(websocket)
     try:
