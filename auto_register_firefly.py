@@ -1081,6 +1081,7 @@ async def main():
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
+            "--disable-gpu",
             "--disable-infobars",
             "--disable-dev-shm-usage",
             "--disable-background-networking",
@@ -1095,11 +1096,6 @@ async def main():
             "--media-cache-size=1",
             "--window-size=1280,800",
         ]
-        if not SHOW_BROWSER:
-            # 使用 Chrome 新无头模式 (--headless=new)，不使用 Playwright 旧的 headless=True
-            # 旧模式会同时注入 --headless，与 --headless=new 冲突，导致 GPU/渲染问题
-            launch_args.append("--headless=new")
-
         # 移除原有的 YesCaptcha 扩展加载逻辑，改用纯 API 方案
         # 以防扩展窗口占用或引发崩溃
         browser_proxy = build_playwright_proxy()
@@ -1107,9 +1103,7 @@ async def main():
             log(f"  🌐 浏览器代理: {browser_proxy['server']}")
 
         launch_options = {
-            # headless=False：让 Playwright 不自动注入旧版 --headless 参数
-            # 真正的无头模式由 launch_args 中的 --headless=new 控制
-            "headless": False,
+            "headless": not SHOW_BROWSER,
             "slow_mo": 200,
             "args": launch_args,
             "viewport": {"width": 1280, "height": 800},
